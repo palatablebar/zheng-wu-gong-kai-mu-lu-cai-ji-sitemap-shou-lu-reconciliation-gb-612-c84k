@@ -8,6 +8,13 @@
 - `canonical_mismatch`（rel=canonical 指向别处）→ P2
 
 覆盖率 `|A∩B∩C| / |A|`；不可达率 `|A\\C| / |A|`。
+
+挂载点口径：
+- `catalog_items` 每行 = 一个当前挂载位置（同一 canonical 挂在多个栏目/页码时有多行）；
+- 对账仍按地址算一份：A 集合、覆盖率、缺陷单都按 canonical 去重；
+- 缺陷证据展开该地址的全部当前挂载（`evidence.mounts`），整改时能核对每个栏目/页码；
+- 没有挂载位置的地址不会出现在 catalog_items 里（无挂载不算已收录）。
+
 纯函数：输入集合 + 探测结果，输出缺陷与统计，两次调用完全一致。
 """
 from __future__ import annotations
@@ -26,6 +33,38 @@ CATEGORY_TITLES: dict[str, str] = {
 
 def _round(value: float) -> float:
     return round(float(value), 4)
+
+
+def _page_no(item: dict) -> int:
+    try:
+        return int(item.get("page_no") or 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _mount_views(items: list[dict]) -> list[dict]:
+    """同一 canonical 的全部当前挂载位置（栏目/页码/入口），去重并按确定顺序排序。"""
+    mounts: list[dict] = []
+    seen: set[tuple] = set()
+    for item in items:
+        mount = {
+            "column": str(item.get("column_name") or ""),
+            "column_code": str(item.get("column_code") or ""),
+            "page_no": _page_no(item),
+            "entry_url": str(item.get("entry_url") or ""),
+            "page_url": str(item.get("page_url") or ""),
+        }
+        key = (mount["column_code"], mount["column"], mount["page_no"], mount["entry_url"], mount["page_url"])
+        if key in seen:
+            continue
+        seen.add(key)
+        mounts.append(mount)
+    mounts.sort(key=lambda mount: (mount["column_code"], mount["page_no"], mount["entry_url"], mount["column"]))
+    return mounts
+
+
+def _distinct_entry_urls(items: list[dict]) -> list[str]:
+    return sorted({str(item.get("entry_url") or "") for item in items if item.get("entry_url")})
 
 
 def reconcile(
@@ -74,26 +113,32 @@ def reconcile(
 
     # 1) A 有 B 没有 → 收录缺失
     for canonical in sorted(set_a - set_b):
-        item = catalog_map[canonical][0]
+        mounts = _mount_views(catalog_map[canonical])
+        first = mounts[0]
         probe = probes.get(canonical) or {}
+        where = f"栏目「{first['column'] or '未分类'}」第 {first['page_no']} 页"
+        if len(mounts) > 1:
+            where = f"{where} 等 {len(mounts)} 处挂载位置"
         push(
             DefectCategory.ONLY_IN_CATALOG.value,
             canonical,
             title=CATEGORY_TITLES[DefectCategory.ONLY_IN_CATALOG.value],
             summary=(
-                f"栏目「{item.get('column_name') or '未分类'}」第 {item.get('page_no') or 1} 页已发布该条目，"
+                f"{where}已发布该条目，"
                 f"但 sitemap.xml 中没有对应 loc；搜索引擎无法从 sitemap 发现它。"
             ),
             evidence={
-                "column": item.get("column_name") or "",
-                "page_no": item.get("page_no") or 1,
-                "entry_url": item.get("entry_url") or canonical,
+                "column": first["column"],
+                "page_no": first["page_no"],
+                "entry_url": first["entry_url"] or canonical,
+                "mounts": mounts,
+                "mount_count": len(mounts),
                 "in_catalog": True,
                 "in_sitemap": False,
                 "http_status": probe.get("status"),
                 "action": "把该 canonical URL 补进 sitemap.xml，lastmod 用详情页最后更新时间",
             },
-            column_name=item.get("column_name") or "",
+            column_name=first["column"],
         )
 
     # 2) B 有 A 没有 → 死链 / 纯 sitemap 条目
@@ -125,7 +170,8 @@ def reconcile(
 
     # 3) A ∩ B → 不可达（同样算死链）/ 重定向链 / canonical 口径
     for canonical in sorted(set_a & set_b):
-        item = catalog_map[canonical][0]
+        mounts = _mount_views(catalog_map[canonical])
+        first = mounts[0]
         probe = probes.get(canonical) or {}
         status = probe.get("status")
         if status != 200:
@@ -142,11 +188,13 @@ def reconcile(
                     "lastmod": sitemap_map[canonical].get("lastmod"),
                     "source_file": sitemap_map[canonical].get("source_file") or "sitemap.xml",
                     "in_catalog": True,
+                    "mounts": mounts,
+                    "mount_count": len(mounts),
                     "http_status": status,
                     "redirect_chain": probe.get("redirect_chain") or [],
                     "action": "同时从 sitemap.xml 与栏目页撤下该 URL",
                 },
-                column_name=item.get("column_name") or "",
+                column_name=first["column"],
             )
             continue
         chain = probe.get("redirect_chain") or []
@@ -163,9 +211,11 @@ def reconcile(
                     "final_url": probe.get("final_url"),
                     "hops": len(chain),
                     "chain_text": hops,
+                    "mounts": mounts,
+                    "mount_count": len(mounts),
                     "action": "sitemap 与栏目入口统一改成 301 的最终 URL，并保留旧 URL 的 301 至少 6 个月",
                 },
-                column_name=item.get("column_name") or "",
+                column_name=first["column"],
             )
             continue
         if canonical_tag:
@@ -180,9 +230,11 @@ def reconcile(
                         "page_canonical": tag_canonical,
                         "expected_canonical": canonical,
                         "canonical_tag_raw": canonical_tag,
+                        "mounts": mounts,
+                        "mount_count": len(mounts),
                         "action": "把 rel=canonical 改成页面自身 canonical URL",
                     },
-                    column_name=item.get("column_name") or "",
+                    column_name=first["column"],
                 )
 
     # 4) 同一 canonical 被多条原始 URL 登记 → 重复 slug
@@ -190,9 +242,10 @@ def reconcile(
         raws = catalog_map[canonical]
         if len(raws) < 2:
             continue
-        entry_urls = sorted({str(item.get("entry_url") or "") for item in raws if item.get("entry_url")})
+        entry_urls = _distinct_entry_urls(raws)
         if len(entry_urls) < 2:
             continue
+        mounts = _mount_views(raws)
         push(
             DefectCategory.DUPLICATE_SLUG.value,
             canonical,
@@ -201,9 +254,11 @@ def reconcile(
             evidence={
                 "entry_urls": entry_urls,
                 "canonical": canonical,
+                "mounts": mounts,
+                "mount_count": len(mounts),
                 "action": "只保留一个入口写法，其余改成 301 指到 canonical",
             },
-            column_name=raws[0].get("column_name") or "",
+            column_name=mounts[0]["column"] if mounts else "",
         )
 
     severity_rank = {"p0": 0, "p1": 1, "p2": 2}
@@ -230,7 +285,7 @@ def reconcile(
         "dead": dead_count,
         "sitemap_dead_rate": sitemap_dead_rate,
         "sitemap_extra_live": len(live_sitemap_extras),
-        "duplicates": sum(1 for canonical in set_a if len(catalog_map[canonical]) > 1),
+        "duplicates": sum(1 for canonical in set_a if len(_distinct_entry_urls(catalog_map[canonical])) > 1),
         "p0": sum(1 for defect in defects if defect["severity"] == "p0"),
         "p1": sum(1 for defect in defects if defect["severity"] == "p1"),
         "p2": sum(1 for defect in defects if defect["severity"] == "p2"),

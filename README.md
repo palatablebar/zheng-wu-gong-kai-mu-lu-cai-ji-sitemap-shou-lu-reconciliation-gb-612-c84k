@@ -97,7 +97,7 @@ backend/
   src/{config,constants,controllers,middlewares,models,routes,schemas,services,utils}
   scripts/{seed_demo.py,demo_config.py,worker_healthcheck.sh}
   migrations/
-  tests/{test_url_normalize.py,test_crawl_engine.py,test_reconcile_engine.py,test_acceptance.py,test_security.py}
+  tests/{test_url_normalize.py,test_crawl_engine.py,test_reconcile_engine.py,test_acceptance.py,test_security.py,test_catalog_mounts.py}
 frontend/
   site/{index.html,css/{tokens,app}.css,js/{config,api,store,ui,app}.js,js/pages/*.js}
 sample_site/<site_code>/         ← seed 运行时在容器内生成（不进仓库）
@@ -121,7 +121,8 @@ sample_site/<site_code>/         ← seed 运行时在容器内生成（不进�
 
 ### 算法 B｜三向对账（`services/reconcile_engine.py`）
 
-- **集合定义**：`A` = 目录条目 canonical 集合；`B` = sitemap loc canonical 集合；`C` = 探测返回 200 的集合。
+- **集合定义**：`A` = 当前挂载点的 canonical 集合（按地址算一份；无挂载的文件不算已收录）；`B` = sitemap loc canonical 集合；`C` = 探测返回 200 的集合。
+- **挂载点口径**：同一公开文件可挂在多个栏目/页码下。每次巡检把算法 A 看到的（栏目、页码、入口位置）按站点全量校准进 `catalog_mounts`（自然键 `site_id+canonical_url+column_code+page_no`）：仍存在的位置原样保留、新位置插入、消失位置删除，重跑不新增重复记录。缺陷证据（`evidence.mounts`）、栏目明细与缺陷 CSV 导出都展开该地址的全部当前挂载，整改时逐处核对。
 - **分类与严重度**：
   | 判定 | 分类 | 严重度 |
   |---|---|---|
@@ -139,7 +140,8 @@ sample_site/<site_code>/         ← seed 运行时在容器内生成（不进�
 |---|---|---|
 | 账号 | 3 | admin / analyst / viewer，密码 `Demo@2026` |
 | 站点（`SEED_SUMMARY sources=`） | 3 | `zwgk-hezhou` / `zwfw-hezhou` / `quxian-hezhou` |
-| 目录条目（A） | 360 | 每站 6 栏 × 120 条 |
+| 目录条目（A） | 360 | 每站 6 栏 × 120 条（按 canonical 地址计） |
+| 挂载点（`catalog_mounts`） | 360 | 每文件 1 处挂载；同一文件挂多栏目时按位置计多行 |
 | 分页清单页 | 36 | 每站 12 页（page_size=12） |
 | sitemap loc（B） | 362 | 360 − 12 条漏收 + 14 条死链 |
 | 巡检（`runs=`） | 1 | `seed-crawl-2026q4`，触发方式 `seed` |

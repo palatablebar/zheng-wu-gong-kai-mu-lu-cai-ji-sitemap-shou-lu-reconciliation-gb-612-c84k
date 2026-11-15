@@ -15,6 +15,13 @@ function evidenceBlock(item) {
   if (evidence.page_canonical) lines.push(`页面 rel=canonical：${evidence.page_canonical}\n应为：${evidence.expected_canonical}`);
   if (evidence.sitemap_loc) lines.push(`sitemap loc：${evidence.sitemap_loc}\nlastmod：${evidence.lastmod || '—'}\n来源文件：${evidence.source_file || 'sitemap.xml'}`);
   if (evidence.entry_url) lines.push(`目录入口：${evidence.entry_url}\n栏目：${evidence.column || '—'}（第 ${evidence.page_no || 1} 页）`);
+  if (evidence.mounts && evidence.mounts.length) {
+    lines.push(`当前挂载（${evidence.mounts.length} 处）：`);
+    evidence.mounts.forEach((mount) => {
+      const where = `${mount.column || mount.column_code || '未分类'} · 第 ${mount.page_no || 1} 页`;
+      lines.push(`  ${where}${mount.page_url ? `\n    ${mount.page_url}` : ''}`);
+    });
+  }
   if (evidence.http_status !== undefined && evidence.http_status !== null) lines.push(`探测状态：HTTP ${evidence.http_status}`);
   if (evidence.entry_urls) lines.push(`重复入口（${evidence.entry_urls.length} 条）：\n  ${evidence.entry_urls.join('\n  ')}`);
   if (evidence.action) lines.push(`\n整改建议：${evidence.action}`);

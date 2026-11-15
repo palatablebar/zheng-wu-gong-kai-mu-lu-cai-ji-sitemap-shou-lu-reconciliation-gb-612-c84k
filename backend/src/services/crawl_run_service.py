@@ -2,6 +2,10 @@
 
 一次巡检处理「一个站点」或「全部启用站点」。所有计算在后端完成，
 前端只消费 /api/crawl-runs 与 /api/defects 的结果。
+
+挂载点校准：每次巡检把算法 A 看到的（栏目、页码、入口位置）全量同步到
+catalog_mounts（按站点）：仍存在的位置原样保留、新位置插入、消失位置删除；
+对账的 A 集合取自当前挂载（按 canonical 算一份），无挂载的文件不算已收录。
 """
 from __future__ import annotations
 
@@ -11,13 +15,12 @@ from sqlalchemy.orm import Session
 from src.constants.demo_data import SITES as SITE_SPECS
 from src.constants.enums import CRAWL_STATUS_LABELS, TRIGGER_LABELS, CrawlStatus
 from src.constants.limits import MAX_CRAWL_DEPTH, MAX_CRAWL_PAGES
-from src.models.catalog_item import CatalogItem
 from src.models.crawl_run import CrawlRun
 from src.models.defect import Defect
 from src.models.site import Site
 from src.models.sitemap_entry import SitemapEntry
-from src.services import crawl_engine, fixture_site, reconcile_engine
-from src.services.url_normalize import normalize_url
+from src.services import catalog_service, crawl_engine, fixture_site, reconcile_engine
+from src.services.url_normalize import normalize_url, url_path
 from src.utils.errors import AppError
 from src.utils.timeutil import iso_utc, local_now, utcnow
 
@@ -61,19 +64,48 @@ def next_run_no(db: Session) -> str:
     return f"{prefix}-{count + 1:04d}"
 
 
+def _column_code(column_url: str) -> str:
+    """栏目入口 URL → 栏目代码（取路径末段，如 /xxgk/zcwj/ → zcwj）。"""
+    segment = url_path(column_url).rstrip("/").rsplit("/", 1)[-1]
+    return (segment or "root")[:60]
+
+
+def _mounts_from_crawl(crawl: dict) -> list[dict]:
+    """算法 A 的链接明细 → 挂载点列表：同一地址在同一栏目同一页只留一个位置。
+
+    crawl["links"] 已按 (canonical, raw) 排序，同一位置取首条，结果确定。
+    """
+    mounts: list[dict] = []
+    seen: set[tuple[str, str, int]] = set()
+    for link in crawl.get("links") or []:
+        canonical = link.get("canonical") or ""
+        if not canonical:
+            continue
+        column_code = _column_code(link.get("column_url") or "")
+        page_no = int(link.get("page_no") or 1)
+        key = (canonical, column_code, page_no)
+        if key in seen:
+            continue
+        seen.add(key)
+        mounts.append(
+            {
+                "canonical_url": canonical,
+                "column_code": column_code,
+                "column_name": link.get("column_name") or "",
+                "page_no": page_no,
+                "page_url": link.get("page_url") or "",
+                "entry_url": canonical,
+                "source_href": link.get("raw") or "",
+                "title": link.get("title") or "",
+                "discovered_from": link.get("discovered_from") or "rel_next",
+            }
+        )
+    return mounts
+
+
 def _catalog_payload(db: Session, site_id: int) -> list[dict]:
-    rows = db.scalars(select(CatalogItem).where(CatalogItem.site_id == site_id)).all()
-    return [
-        {
-            "entry_url": row.entry_url,
-            "canonical_url": row.canonical_url,
-            "column_name": row.column_name,
-            "column_code": row.column_code,
-            "page_no": row.page_no,
-            "title": row.title,
-        }
-        for row in rows
-    ]
+    """对账 A 集合 = 该站点当前挂载点（无挂载的登记文件不算已收录）。"""
+    return catalog_service.list_mounts(db, site_id)
 
 
 def _sitemap_payload(db: Session, site_id: int) -> list[dict]:
@@ -120,7 +152,7 @@ def _upsert_defects(db: Session, run: CrawlRun, site: Site, defects: list[dict])
             existing.evidence = item["evidence"]
 
 
-def _site_metrics(site: Site, crawl: dict, result: dict) -> dict:
+def _site_metrics(site: Site, crawl: dict, result: dict, mounts_sync: dict) -> dict:
     stats = result["stats"]
     crawl_stats = crawl["stats"]
     return {
@@ -133,6 +165,9 @@ def _site_metrics(site: Site, crawl: dict, result: dict) -> dict:
         "dup_ratio": crawl_stats["dup_ratio"],
         "depth_max": crawl_stats["depth_max"],
         "columns": crawl_stats["columns"],
+        "mounts": mounts_sync["total"],
+        "mounts_added": mounts_sync["added"],
+        "mounts_removed": mounts_sync["removed"],
         "catalog_total": stats["catalog_total"],
         "sitemap_total": stats["sitemap_total"],
         "reachable": stats["reachable"],
@@ -156,6 +191,9 @@ def execute_run(db: Session, run: CrawlRun, sites: list[Site]) -> CrawlRun:
             "pages": 0,
             "links": 0,
             "unique": 0,
+            "mounts": 0,
+            "mounts_added": 0,
+            "mounts_removed": 0,
             "catalog_total": 0,
             "sitemap_total": 0,
             "hit": 0,
@@ -180,6 +218,11 @@ def execute_run(db: Session, run: CrawlRun, sites: list[Site]) -> CrawlRun:
                 max_depth=min(site.max_depth or 3, MAX_CRAWL_DEPTH),
                 max_pages=MAX_CRAWL_PAGES,
             )
+            # 挂载点校准：本次抓取到的位置全量同步；站点没抓通（0 个清单页）时不动旧挂载，避免误删
+            if crawl["stats"]["pages"] > 0:
+                mounts_sync = catalog_service.sync_mounts(db, site.id, _mounts_from_crawl(crawl))
+            else:
+                mounts_sync = {"added": 0, "updated": 0, "removed": 0, "total": 0}
             sitemap_rows = _sitemap_payload(db, site.id)
             probes = dict(crawl["probes"])
             extra = [row["canonical_url"] for row in sitemap_rows if normalize_url(row["canonical_url"]) not in probes]
@@ -192,7 +235,7 @@ def execute_run(db: Session, run: CrawlRun, sites: list[Site]) -> CrawlRun:
                 probes=probes,
             )
             _upsert_defects(db, run, site, result["defects"])
-            metrics = _site_metrics(site, crawl, result)
+            metrics = _site_metrics(site, crawl, result, mounts_sync)
             per_site.append(metrics)
             for key in totals:
                 totals[key] += int(metrics.get(key, 0) or 0)
@@ -225,6 +268,9 @@ def execute_run(db: Session, run: CrawlRun, sites: list[Site]) -> CrawlRun:
                 "pages": totals["pages"],
                 "links": totals["links"],
                 "unique": totals["unique"],
+                "mounts": totals["mounts"],
+                "mounts_added": totals["mounts_added"],
+                "mounts_removed": totals["mounts_removed"],
                 "catalog_total": totals["catalog_total"],
                 "sitemap_total": totals["sitemap_total"],
                 "hit": totals["hit"],
@@ -242,6 +288,7 @@ def execute_run(db: Session, run: CrawlRun, sites: list[Site]) -> CrawlRun:
             [
                 f"巡检 {run.run_no}：{len(sites)} 个站点、{totals['pages']} 个分页清单页",
                 f"抓取链接 {totals['links']} 条，canonical 去重后 {totals['unique']} 条（重复率 {dup_ratio:.2%}）",
+                f"当前挂载 {totals['mounts']} 处（新增 {totals['mounts_added']} / 移除 {totals['mounts_removed']}）",
                 f"目录条目 {totals['catalog_total']} 条、sitemap loc {totals['sitemap_total']} 条",
                 f"三向命中 {totals['hit']} 条 → 覆盖率 {coverage:.2%}，不可达率 {unreachable_rate:.2%}",
                 f"检出缺陷 {run.defect_count} 条：P0 {totals['p0']} / P1 {totals['p1']} / P2 {totals['p2']}",

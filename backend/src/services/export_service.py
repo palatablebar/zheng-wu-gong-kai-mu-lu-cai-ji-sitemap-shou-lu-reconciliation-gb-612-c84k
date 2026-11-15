@@ -19,6 +19,7 @@ DEFECT_HEADERS = [
     "严重度",
     "严重度说明",
     "栏目",
+    "全部挂载点",
     "canonical URL",
     "sitemap loc",
     "证据摘要",
@@ -62,6 +63,16 @@ COVERAGE_HEADERS = [
 ]
 
 
+def _mounts_text(evidence: dict) -> str:
+    """缺陷证据里的全部当前挂载点：「栏目 第N页」逐处列出，整改时按单核对。"""
+    mounts = evidence.get("mounts") or []
+    parts = []
+    for mount in mounts:
+        column = mount.get("column") or mount.get("column_code") or "未分类"
+        parts.append(f"{column} 第{mount.get('page_no') or 1}页")
+    return "；".join(parts)
+
+
 def _evidence_text(defect: Defect) -> str:
     evidence = defect.evidence or {}
     chain = evidence.get("redirect_chain") or []
@@ -76,6 +87,9 @@ def _evidence_text(defect: Defect) -> str:
         parts.append(f"sitemap loc={evidence['sitemap_loc']}")
     if evidence.get("entry_url"):
         parts.append(f"目录入口={evidence['entry_url']}")
+    mounts_text = _mounts_text(evidence)
+    if mounts_text:
+        parts.append(f"挂载点={mounts_text}")
     return "；".join(parts)
 
 
@@ -95,6 +109,7 @@ def defects_csv(db: Session, run_id: int | None = None) -> bytes:
             defect.severity.upper(),
             DEFECT_SEVERITY_LABELS.get(defect.severity, defect.severity),
             defect.column_name,
+            _mounts_text(defect.evidence or {}),
             defect.canonical_url,
             (defect.evidence or {}).get("sitemap_loc", ""),
             _evidence_text(defect),

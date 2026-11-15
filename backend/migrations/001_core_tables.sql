@@ -47,6 +47,28 @@ CREATE TABLE catalog_items (
     INDEX ix_catalog_canonical (canonical_url)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- 目录挂载点：同一公开文件在「栏目 / 页码」上的当前位置（每次巡检按站点全量校准）
+-- 自然键 (site_id, canonical_url, column_code, page_no)：重跑 upsert 不新增重复；
+-- 本次仍存在的位置保留、消失的删除；对账 A 集合 = 当前仍有挂载的地址（按地址算一份）。
+CREATE TABLE catalog_mounts (
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    site_id         INT NOT NULL,
+    canonical_url   VARCHAR(300) NOT NULL,
+    column_code     VARCHAR(60)  NOT NULL,
+    column_name     VARCHAR(120),
+    page_no         INT NOT NULL DEFAULT 1,
+    entry_url       VARCHAR(300),
+    page_url        VARCHAR(300),
+    source_href     VARCHAR(300),
+    title           VARCHAR(200),
+    discovered_from VARCHAR(20),
+    created_at      DATETIME NOT NULL,
+    CONSTRAINT uq_mount_site_position UNIQUE (site_id, canonical_url, column_code, page_no),
+    CONSTRAINT fk_mount_site FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE,
+    INDEX ix_mount_canonical (canonical_url),
+    INDEX ix_mount_column (column_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE sitemap_entries (
     id              INT AUTO_INCREMENT PRIMARY KEY,
     site_id         INT NOT NULL,
